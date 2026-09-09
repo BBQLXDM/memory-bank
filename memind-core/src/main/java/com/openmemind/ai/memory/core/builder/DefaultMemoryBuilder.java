@@ -1,0 +1,312 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.core.builder;
+
+import com.openmemind.ai.memory.core.DefaultMemory;
+import com.openmemind.ai.memory.core.Memory;
+import com.openmemind.ai.memory.core.buffer.MemoryBuffer;
+import com.openmemind.ai.memory.core.extraction.MemoryExtractor;
+import com.openmemind.ai.memory.core.extraction.insight.tree.BubbleTrackerStore;
+import com.openmemind.ai.memory.core.llm.ChatClientRegistry;
+import com.openmemind.ai.memory.core.llm.ChatClientSlot;
+import com.openmemind.ai.memory.core.llm.StructuredChatClient;
+import com.openmemind.ai.memory.core.llm.rerank.NoopReranker;
+import com.openmemind.ai.memory.core.llm.rerank.Reranker;
+import com.openmemind.ai.memory.core.metrics.MemoryMetricsRecorder;
+import com.openmemind.ai.memory.core.metrics.NoopMemoryMetricsRecorder;
+import com.openmemind.ai.memory.core.plugin.RawDataPlugin;
+import com.openmemind.ai.memory.core.prompt.PromptRegistry;
+import com.openmemind.ai.memory.core.resource.ContentParserRegistry;
+import com.openmemind.ai.memory.core.resource.ResourceFetcher;
+import com.openmemind.ai.memory.core.retrieval.MemoryRetriever;
+import com.openmemind.ai.memory.core.store.MemoryStore;
+import com.openmemind.ai.memory.core.textsearch.MemoryTextSearch;
+import com.openmemind.ai.memory.core.tracing.MemoryObserver;
+import com.openmemind.ai.memory.core.tracing.NoopMemoryObserver;
+import com.openmemind.ai.memory.core.tracing.decorator.TracingMemoryExtractor;
+import com.openmemind.ai.memory.core.tracing.decorator.TracingMemoryRetriever;
+import com.openmemind.ai.memory.core.vector.MemoryVector;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class DefaultMemoryBuilder implements MemoryBuilder {
+
+    private static final Logger log = LoggerFactory.getLogger(DefaultMemoryBuilder.class);
+
+    private StructuredChatClient chatClient;
+    private final Map<ChatClientSlot, StructuredChatClient> slotClients =
+            new EnumMap<>(ChatClientSlot.class);
+    private MemoryStore store;
+    private MemoryBuffer buffer;
+    private MemoryTextSearch textSearch;
+    private MemoryVector vector;
+    private Reranker reranker = new NoopReranker();
+    private PromptRegistry promptRegistry = PromptRegistry.EMPTY;
+    private ContentParserRegistry contentParserRegistry;
+    private ResourceFetcher resourceFetcher;
+    private BubbleTrackerStore bubbleTrackerStore;
+    private final List<RawDataPlugin> rawDataPlugins = new ArrayList<>();
+    private MemoryBuildOptions options = MemoryBuildOptions.defaults();
+    private MemoryObserver memoryObserver = new NoopMemoryObserver();
+    private MemoryMetricsRecorder memoryMetricsRecorder = NoopMemoryMetricsRecorder.INSTANCE;
+    private boolean externallyManaged;
+
+    @Override
+    public MemoryBuilder chatClient(StructuredChatClient chatClient) {
+        this.chatClient = Objects.requireNonNull(chatClient, "chatClient");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder chatClient(ChatClientSlot slot, StructuredChatClient chatClient) {
+        Objects.requireNonNull(slot, "slot");
+        Objects.requireNonNull(chatClient, "chatClient");
+        slotClients.put(slot, chatClient);
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder store(MemoryStore store) {
+        this.store = Objects.requireNonNull(store, "store");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder buffer(MemoryBuffer buffer) {
+        this.buffer = Objects.requireNonNull(buffer, "buffer");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder textSearch(MemoryTextSearch textSearch) {
+        this.textSearch = Objects.requireNonNull(textSearch, "textSearch");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder vector(MemoryVector vector) {
+        this.vector = Objects.requireNonNull(vector, "vector");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder reranker(Reranker reranker) {
+        this.reranker = Objects.requireNonNull(reranker, "reranker");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder promptRegistry(PromptRegistry promptRegistry) {
+        this.promptRegistry = Objects.requireNonNull(promptRegistry, "promptRegistry");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder contentParserRegistry(ContentParserRegistry contentParserRegistry) {
+        this.contentParserRegistry =
+                Objects.requireNonNull(contentParserRegistry, "contentParserRegistry");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder rawDataPlugin(RawDataPlugin plugin) {
+        RawDataPlugin resolved = Objects.requireNonNull(plugin, "plugin");
+        String pluginId = Objects.requireNonNull(resolved.pluginId(), "plugin.pluginId()");
+        if (rawDataPlugins.stream().anyMatch(existing -> existing.pluginId().equals(pluginId))) {
+            throw new IllegalArgumentException("duplicate pluginId: " + pluginId);
+        }
+        rawDataPlugins.add(resolved);
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder resourceFetcher(ResourceFetcher resourceFetcher) {
+        this.resourceFetcher = Objects.requireNonNull(resourceFetcher, "resourceFetcher");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder bubbleTrackerStore(BubbleTrackerStore bubbleTrackerStore) {
+        this.bubbleTrackerStore = Objects.requireNonNull(bubbleTrackerStore, "bubbleTrackerStore");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder options(MemoryBuildOptions options) {
+        this.options = Objects.requireNonNull(options, "options");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder memoryObserver(MemoryObserver observer) {
+        this.memoryObserver = Objects.requireNonNull(observer, "observer");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder memoryMetricsRecorder(MemoryMetricsRecorder recorder) {
+        this.memoryMetricsRecorder = Objects.requireNonNull(recorder, "recorder");
+        return this;
+    }
+
+    @Override
+    public MemoryBuilder externallyManaged(boolean externallyManaged) {
+        this.externallyManaged = externallyManaged;
+        return this;
+    }
+
+    @Override
+    public Memory build() {
+        validateRequiredComponents();
+
+        var sanitization = new MemoryBuildOptionsSanitizer().sanitize(options, store);
+        sanitization.warnings().forEach(log::warn);
+        MemoryBuildOptions effectiveOptions = sanitization.options();
+        ChatClientRegistry registry = new ChatClientRegistry(chatClient, slotClients);
+        MemoryAssemblyContext context =
+                new MemoryAssemblyContext(
+                        registry,
+                        store,
+                        buffer,
+                        textSearch,
+                        vector,
+                        reranker,
+                        promptRegistry,
+                        effectiveOptions,
+                        contentParserRegistry,
+                        resourceFetcher,
+                        List.copyOf(rawDataPlugins),
+                        bubbleTrackerStore,
+                        memoryObserver,
+                        memoryMetricsRecorder,
+                        sanitization.memoryThreadForcedDisableReason());
+        MemoryExtractionAssembly extractionAssembly =
+                new MemoryExtractionAssembler().assemble(context);
+        MemoryExtractor pipeline =
+                tracingExtractor(
+                        extractionAssembly.pipeline(),
+                        context.memoryObserver(),
+                        context.memoryMetricsRecorder());
+        MemoryRetriever memoryRetriever =
+                tracingRetriever(
+                        new MemoryRetrievalAssembler().assemble(context),
+                        context.memoryObserver(),
+                        context.memoryMetricsRecorder());
+        AutoCloseable lifecycle =
+                externallyManaged
+                        ? lifecycle(extractionAssembly.lifecycle())
+                        : lifecycle(
+                                context.memoryVector(),
+                                context.textSearch(),
+                                context.chatClientRegistry().defaultClient(),
+                                context.memoryStore(),
+                                context.memoryBuffer(),
+                                extractionAssembly.lifecycle());
+        return new DefaultMemory(
+                pipeline,
+                memoryRetriever,
+                context.memoryStore(),
+                context.memoryBuffer(),
+                context.memoryVector(),
+                extractionAssembly.insightLayer(),
+                lifecycle,
+                effectiveOptions,
+                extractionAssembly.memoryThreadLayer());
+    }
+
+    private MemoryExtractor tracingExtractor(
+            MemoryExtractor extractor, MemoryObserver observer, MemoryMetricsRecorder recorder) {
+        if (!hasObservability(observer, recorder) || extractor instanceof TracingMemoryExtractor) {
+            return extractor;
+        }
+        return new TracingMemoryExtractor(extractor, observer, recorder);
+    }
+
+    private MemoryRetriever tracingRetriever(
+            MemoryRetriever retriever, MemoryObserver observer, MemoryMetricsRecorder recorder) {
+        if (!hasObservability(observer, recorder) || retriever instanceof TracingMemoryRetriever) {
+            return retriever;
+        }
+        return new TracingMemoryRetriever(retriever, observer);
+    }
+
+    private boolean hasObservability(MemoryObserver observer, MemoryMetricsRecorder recorder) {
+        return !(observer instanceof NoopMemoryObserver)
+                || !(recorder instanceof NoopMemoryMetricsRecorder);
+    }
+
+    MemoryBuildOptions buildOptions() {
+        return options;
+    }
+
+    private void validateRequiredComponents() {
+        if (chatClient == null) {
+            throw new IllegalStateException("Missing required chat client");
+        }
+        if (store == null) {
+            throw new IllegalStateException("Missing required store");
+        }
+        if (buffer == null) {
+            throw new IllegalStateException("Missing required buffer");
+        }
+        if (vector == null) {
+            throw new IllegalStateException("Missing required vector");
+        }
+    }
+
+    private AutoCloseable lifecycle(Object... candidates) {
+        List<AutoCloseable> closeables = uniqueCloseables(candidates);
+
+        return () -> {
+            RuntimeException closeFailure = null;
+            for (int i = closeables.size() - 1; i >= 0; i--) {
+                try {
+                    closeables.get(i).close();
+                } catch (Exception e) {
+                    if (closeFailure == null) {
+                        closeFailure =
+                                new IllegalStateException("Failed to close memory lifecycle", e);
+                    } else {
+                        closeFailure.addSuppressed(e);
+                    }
+                }
+            }
+            if (closeFailure != null) {
+                throw closeFailure;
+            }
+        };
+    }
+
+    private static AutoCloseable autoCloseable(Object candidate) {
+        return candidate instanceof AutoCloseable closeable ? closeable : null;
+    }
+
+    private static List<AutoCloseable> uniqueCloseables(Object... candidates) {
+        List<AutoCloseable> ordered = new ArrayList<>();
+        IdentityHashMap<AutoCloseable, Boolean> seen = new IdentityHashMap<>();
+        for (Object candidate : candidates) {
+            AutoCloseable closeable = autoCloseable(candidate);
+            if (closeable != null && seen.put(closeable, Boolean.TRUE) == null) {
+                ordered.add(closeable);
+            }
+        }
+        return ordered;
+    }
+}

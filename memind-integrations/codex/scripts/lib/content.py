@@ -1,0 +1,150 @@
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import json
+import re
+from pathlib import Path
+
+MEMIND_BLOCK_RE = re.compile(r"<memind_memories>.*?</memind_memories>", re.DOTALL)
+CODEX_CONTROL_BLOCK_RE = re.compile(
+    r"<(?P<tag>environment_context|permissions instructions|collaboration_mode|skills_instructions|plugins_instructions|personality_spec)>.*?</(?P=tag)>",
+    re.DOTALL,
+)
+INTERRUPTION_RE = re.compile(r"^\[(?:Request|Response) interrupted by user\]$")
+TEXT_BLOCK_TYPES = {"input_text", "output_text", "text"}
+TOOL_TYPES = {
+    "local_shell_call",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "web_search_call",
+    "event_msg",
+}
+
+
+def strip_memind_blocks(text):
+    return MEMIND_BLOCK_RE.sub("", text or "")
+
+
+def _strip_codex_control_blocks(text):
+    return CODEX_CONTROL_BLOCK_RE.sub("", text or "")
+
+
+def _is_noise_text(text):
+    normalized = (text or "").strip()
+    return not normalized or bool(INTERRUPTION_RE.match(normalized))
+
+
+def _parse_jsonl(path):
+    for index, line in enumerate(Path(path).read_text(errors="ignore").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            yield index, json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
+def _entry_payload(entry):
+    if entry.get("type") == "response_item":
+        payload = entry.get("payload") or {}
+        payload_type = str(payload.get("type", "")).lower()
+        if payload_type in TOOL_TYPES or payload_type != "message":
+            return None
+        return payload
+    if str(entry.get("type", "")).lower() in TOOL_TYPES:
+        return None
+    if entry.get("role"):
+        return entry
+    return None
+
+
+def _text_blocks(content):
+    if isinstance(content, str):
+        text = _strip_codex_control_blocks(strip_memind_blocks(content)).strip()
+        return [] if _is_noise_text(text) else [text]
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).lower()
+            if block_type in TEXT_BLOCK_TYPES and block.get("text"):
+                text = _strip_codex_control_blocks(strip_memind_blocks(block.get("text", ""))).strip()
+                if not _is_noise_text(text):
+                    texts.append(text)
+        merged = "\n\n".join(texts).strip()
+        return [] if _is_noise_text(merged) else [merged]
+    return []
+
+
+def _timestamp(entry):
+    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+    return entry.get("timestamp") or entry.get("created_at") or payload.get("timestamp") or payload.get("created_at")
+
+
+def _tail_lines(path, max_bytes=65536):
+    path = Path(path)
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        data = handle.read().decode("utf-8", errors="ignore")
+    return data.splitlines()
+
+
+def _entry_texts(entry):
+    payload = _entry_payload(entry)
+    if not payload:
+        return None, []
+    role_text = str(payload.get("role", "")).lower()
+    if role_text not in {"user", "assistant"}:
+        return None, []
+    if role_text == "assistant" and payload.get("phase") not in {None, "final_answer"}:
+        return None, []
+    return role_text, _text_blocks(payload.get("content"))
+
+
+def read_recent_context(path, turns):
+    if not path or turns <= 0 or not Path(path).exists():
+        return ""
+    entries = []
+    for line in reversed(_tail_lines(path)):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role, texts = _entry_texts(entry)
+        if not role or not texts:
+            continue
+        entries.append((role, texts[0]))
+        if len(entries) >= turns * 2:
+            break
+    entries.reverse()
+    return "\n".join(f"{role}: {text}" for role, text in entries)
+
+
+def read_last_assistant_message(path):
+    if not path or not Path(path).exists():
+        return ""
+    for line in reversed(_tail_lines(path)):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role, texts = _entry_texts(entry)
+        if role == "assistant" and texts:
+            return texts[0]
+    return ""

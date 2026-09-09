@@ -1,0 +1,55 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.server.domain.memory.request;
+
+import com.openmemind.ai.memory.core.retrieval.RetrievalConfig;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import java.time.Instant;
+import java.util.List;
+
+public record RetrieveMemoryRequest(
+        @NotBlank String userId,
+        @NotBlank String agentId,
+        @NotBlank String query,
+        @NotNull RetrievalConfig.Strategy strategy,
+        Boolean trace,
+        String scope,
+        List<String> categories,
+        TimeRange timeRange,
+        MetadataFilter metadataFilter,
+        IncludeOptions include) {
+
+    public RetrieveMemoryRequest {
+        categories = categories == null ? List.of() : List.copyOf(categories);
+    }
+
+    public RetrieveMemoryRequest(
+            String userId, String agentId, String query, RetrievalConfig.Strategy strategy) {
+        this(userId, agentId, query, strategy, null);
+    }
+
+    public RetrieveMemoryRequest(
+            String userId,
+            String agentId,
+            String query,
+            RetrievalConfig.Strategy strategy,
+            Boolean trace) {
+        this(userId, agentId, query, strategy, trace, null, List.of(), null, null, null);
+    }
+
+    public record TimeRange(String field, Instant from, Instant to) {}
+
+    public record IncludeOptions(Boolean rawDataMetadata, Boolean rawDataSegment) {}
+}

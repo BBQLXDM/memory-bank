@@ -1,0 +1,8 @@
+# 终端进度面板 demo 依赖
+# 安装：pip install -r requirements.txt
+#
+# demo_ui_a_rich.py  -> rich（原地刷新行式面板）
+# demo_ui_b_textual.py -> textual（卡片网格仪表盘，较重，按需安装）
+
+rich>=13.7.0
+textual>=0.80.0

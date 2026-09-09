@@ -1,0 +1,713 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.core.extraction.rawdata;
+
+import com.openmemind.ai.memory.core.data.MemoryId;
+import com.openmemind.ai.memory.core.data.MemoryRawData;
+import com.openmemind.ai.memory.core.data.MemoryResource;
+import com.openmemind.ai.memory.core.extraction.rawdata.caption.CaptionGenerator;
+import com.openmemind.ai.memory.core.extraction.rawdata.content.ConversationContent;
+import com.openmemind.ai.memory.core.extraction.rawdata.content.RawContent;
+import com.openmemind.ai.memory.core.extraction.rawdata.segment.CharBoundary;
+import com.openmemind.ai.memory.core.extraction.rawdata.segment.MessageBoundary;
+import com.openmemind.ai.memory.core.extraction.rawdata.segment.Segment;
+import com.openmemind.ai.memory.core.extraction.rawdata.segment.SegmentRuntimeContext;
+import com.openmemind.ai.memory.core.extraction.result.RawDataResult;
+import com.openmemind.ai.memory.core.extraction.step.RawDataExtractStep;
+import com.openmemind.ai.memory.core.extraction.step.SegmentProcessor;
+import com.openmemind.ai.memory.core.store.MemoryStore;
+import com.openmemind.ai.memory.core.utils.HashUtils;
+import com.openmemind.ai.memory.core.vector.MemoryVector;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.IntStream;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+/**
+ * RawData layer processing entry.
+ *
+ * <p>Routes chunking and caption generation to registered {@link RawContentProcessor} instances,
+ * then vectorizes and stores the results.
+ */
+public class RawDataLayer implements RawDataExtractStep, SegmentProcessor {
+
+    private final RawContentProcessorRegistry processorRegistry;
+    private final CaptionGenerator defaultCaptionGenerator;
+    private final MemoryStore memoryStore;
+    private final MemoryVector vector;
+    private final int vectorBatchSize;
+
+    /**
+     * Creates a RawDataLayer with a list of content processors.
+     *
+     * @param processorList list of processors (each keyed by its contentClass())
+     * @param defaultCaptionGenerator fallback caption generator when processor provides none
+     * @param memoryStore memory store for persistence
+     * @param vector memory vector for vectorization
+     */
+    public RawDataLayer(
+            List<RawContentProcessor<?>> processorList,
+            CaptionGenerator defaultCaptionGenerator,
+            MemoryStore memoryStore,
+            MemoryVector vector) {
+        this(
+                processorList,
+                defaultCaptionGenerator,
+                memoryStore,
+                vector,
+                com.openmemind.ai.memory.core.builder.RawDataExtractionOptions
+                        .DEFAULT_VECTOR_BATCH_SIZE);
+    }
+
+    public RawDataLayer(
+            List<RawContentProcessor<?>> processorList,
+            CaptionGenerator defaultCaptionGenerator,
+            MemoryStore memoryStore,
+            MemoryVector vector,
+            int vectorBatchSize) {
+        this(
+                new RawContentProcessorRegistry(processorList),
+                defaultCaptionGenerator,
+                memoryStore,
+                vector,
+                vectorBatchSize);
+    }
+
+    public RawDataLayer(
+            RawContentProcessorRegistry processorRegistry,
+            CaptionGenerator defaultCaptionGenerator,
+            MemoryStore memoryStore,
+            MemoryVector vector,
+            int vectorBatchSize) {
+        this.processorRegistry =
+                java.util.Objects.requireNonNull(processorRegistry, "processorRegistry");
+        this.defaultCaptionGenerator = defaultCaptionGenerator;
+        this.memoryStore = memoryStore;
+        this.vector = vector;
+        if (vectorBatchSize <= 0) {
+            throw new IllegalArgumentException("vectorBatchSize must be > 0");
+        }
+        this.vectorBatchSize = vectorBatchSize;
+    }
+
+    @Override
+    public Mono<RawDataResult> extract(
+            MemoryId memoryId,
+            RawContent content,
+            String contentType,
+            Map<String, Object> metadata) {
+        return extract(memoryId, content, contentType, metadata, null);
+    }
+
+    @Override
+    public Mono<RawDataResult> extract(
+            MemoryId memoryId,
+            RawContent content,
+            String contentType,
+            Map<String, Object> metadata,
+            String language) {
+        RawDataInput input = new RawDataInput(memoryId, content, contentType, metadata);
+        return process(input, language)
+                .map(
+                        result ->
+                                new RawDataResult(
+                                        result.rawDataList(), result.segments(), result.existed()));
+    }
+
+    /**
+     * Process raw data.
+     *
+     * @param input Input
+     * @return Processing result
+     */
+    public Mono<RawDataProcessResult> process(RawDataInput input) {
+        return process(input, null);
+    }
+
+    private Mono<RawDataProcessResult> process(RawDataInput input, String language) {
+        String contentId = resolveRawDataContentId(input);
+        MemoryId memoryId = input.memoryId();
+
+        // Idempotency check
+        Optional<MemoryRawData> existing =
+                memoryStore.rawDataOperations().getRawDataByContentId(memoryId, contentId);
+        return existing.map(memoryRawData -> Mono.just(existingRawDataResult(memoryId, contentId)))
+                .orElseGet(() -> doProcess(input, memoryId, contentId, language));
+    }
+
+    @Override
+    public Mono<RawDataResult> processSegment(
+            MemoryId memoryId,
+            Segment segment,
+            String type,
+            String contentId,
+            Map<String, Object> metadata) {
+        return processSegment(memoryId, segment, type, contentId, metadata, null);
+    }
+
+    @Override
+    public Mono<RawDataResult> processSegment(
+            MemoryId memoryId,
+            Segment segment,
+            String type,
+            String contentId,
+            Map<String, Object> metadata,
+            String language) {
+
+        // Idempotency check
+        Optional<MemoryRawData> existing =
+                memoryStore.rawDataOperations().getRawDataByContentId(memoryId, contentId);
+        if (existing.isPresent()) {
+            return Mono.just(toRawDataResult(memoryId, contentId));
+        }
+
+        String contentType = (type != null && !type.isBlank()) ? type : ConversationContent.TYPE;
+
+        // Skip chunk, start directly from caption
+        return defaultCaptionGenerator
+                .generateForSegments(List.of(segment), language)
+                .flatMap(segments -> vectorize(memoryId, segments))
+                .flatMap(
+                        vectorization ->
+                                persistWithCleanup(
+                                                memoryId,
+                                                new RawDataInput(
+                                                        memoryId, null, contentType, metadata),
+                                                contentId,
+                                                vectorization)
+                                        .map(
+                                                result ->
+                                                        new RawDataResult(
+                                                                result.rawDataList(),
+                                                                result.segments(),
+                                                                result.existed())));
+    }
+
+    private Mono<RawDataProcessResult> doProcess(
+            RawDataInput input, MemoryId memoryId, String contentHash, String language) {
+
+        // 1. chunk -- Route via processor registry
+        return chunkContent(input.content())
+                // 2. caption -- Route via processor registry
+                .flatMap(
+                        segments ->
+                                getCaptionGenerator(input.content())
+                                        .generateForSegments(segments, language))
+                // 3. Vectorization
+                .flatMap(segments -> vectorize(memoryId, segments))
+                // 4. Persistence
+                .flatMap(
+                        vectorization ->
+                                persistWithCleanup(memoryId, input, contentHash, vectorization));
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T extends RawContent> Mono<List<Segment>> chunkContent(T content) {
+        return getTypedProcessor(content).chunk(content);
+    }
+
+    private CaptionGenerator getCaptionGenerator(RawContent content) {
+        var generator = processorRegistry.resolve(content).captionGenerator();
+        return generator != null ? generator : defaultCaptionGenerator;
+    }
+
+    private Mono<VectorizationResult> vectorize(MemoryId memoryId, List<Segment> segments) {
+        if (segments.isEmpty()) {
+            return Mono.just(new VectorizationResult(List.of(), List.of()));
+        }
+
+        List<VectorizationCandidate> candidates =
+                IntStream.range(0, segments.size())
+                        .mapToObj(i -> toVectorizationCandidate(i, segments.get(i)))
+                        .filter(candidate -> candidate != null)
+                        .toList();
+        if (candidates.isEmpty()) {
+            return Mono.just(new VectorizationResult(segments, List.of()));
+        }
+
+        List<VectorizedSegment> storedVectors = new ArrayList<>();
+        List<String> storedVectorIds = new ArrayList<>();
+        return Flux.fromIterable(candidates)
+                .buffer(vectorBatchSize)
+                .concatMap(
+                        batch ->
+                                storeVectorBatch(memoryId, batch)
+                                        .doOnNext(
+                                                batchWrites -> {
+                                                    storedVectors.addAll(batchWrites);
+                                                    batchWrites.forEach(
+                                                            write ->
+                                                                    storedVectorIds.add(
+                                                                            write.vectorId()));
+                                                }))
+                .then(
+                        Mono.fromSupplier(
+                                () ->
+                                        new VectorizationResult(
+                                                applyVectorIds(segments, storedVectors),
+                                                List.copyOf(storedVectorIds))))
+                .onErrorResume(
+                        error ->
+                                cleanupVectorIds(memoryId, storedVectorIds, error)
+                                        .then(Mono.error(error)));
+    }
+
+    private Mono<RawDataProcessResult> persistWithCleanup(
+            MemoryId memoryId,
+            RawDataInput input,
+            String contentId,
+            VectorizationResult vectorization) {
+        return Mono.fromCallable(
+                        () -> buildAndPersist(memoryId, input, contentId, vectorization.segments()))
+                .onErrorResume(
+                        error ->
+                                cleanupVectorIds(memoryId, vectorization.vectorIds(), error)
+                                        .then(Mono.error(error)));
+    }
+
+    private VectorizationCandidate toVectorizationCandidate(int index, Segment segment) {
+        String text = resolveVectorText(segment);
+        if (text == null) {
+            return null;
+        }
+        return new VectorizationCandidate(index, text);
+    }
+
+    private String resolveVectorText(Segment segment) {
+        if (segment.caption() != null && !segment.caption().isBlank()) {
+            return segment.caption();
+        }
+        if (segment.content() != null && !segment.content().isBlank()) {
+            return segment.content();
+        }
+        return null;
+    }
+
+    private Mono<List<VectorizedSegment>> storeVectorBatch(
+            MemoryId memoryId, List<VectorizationCandidate> batch) {
+        List<String> texts = batch.stream().map(VectorizationCandidate::text).toList();
+        List<Map<String, Object>> metadataList =
+                batch.stream().map(candidate -> Map.<String, Object>of()).toList();
+        return vector.storeBatch(memoryId, texts, metadataList)
+                .map(
+                        vectorIds -> {
+                            if (vectorIds.size() != batch.size()) {
+                                throw new IllegalStateException(
+                                        "Vector store returned "
+                                                + vectorIds.size()
+                                                + " ids for "
+                                                + batch.size()
+                                                + " inputs");
+                            }
+                            return IntStream.range(0, batch.size())
+                                    .mapToObj(
+                                            i ->
+                                                    new VectorizedSegment(
+                                                            batch.get(i).index(), vectorIds.get(i)))
+                                    .toList();
+                        });
+    }
+
+    private List<Segment> applyVectorIds(
+            List<Segment> segments, List<VectorizedSegment> vectorizedSegments) {
+        Map<Integer, String> vectorIdsByIndex = new HashMap<>();
+        vectorizedSegments.forEach(write -> vectorIdsByIndex.put(write.index(), write.vectorId()));
+        return IntStream.range(0, segments.size())
+                .mapToObj(
+                        i -> {
+                            Segment segment = segments.get(i);
+                            String vectorId = vectorIdsByIndex.get(i);
+                            if (vectorId == null) {
+                                return segment;
+                            }
+                            Map<String, Object> newMetadata = new HashMap<>(segment.metadata());
+                            newMetadata.put("vectorId", vectorId);
+                            return new Segment(
+                                    segment.content(),
+                                    segment.caption(),
+                                    segment.boundary(),
+                                    newMetadata,
+                                    segment.runtimeContext());
+                        })
+                .toList();
+    }
+
+    private Mono<Void> cleanupVectorIds(
+            MemoryId memoryId, List<String> vectorIds, Throwable originalError) {
+        if (vectorIds.isEmpty()) {
+            return Mono.empty();
+        }
+        return vector.deleteBatch(memoryId, List.copyOf(vectorIds))
+                .onErrorResume(
+                        cleanupError -> {
+                            originalError.addSuppressed(cleanupError);
+                            return Mono.empty();
+                        });
+    }
+
+    private RawDataProcessResult buildAndPersist(
+            MemoryId memoryId, RawDataInput input, String contentId, List<Segment> segments) {
+
+        Instant now = Instant.now();
+        Map<String, Object> requestMetadata = new LinkedHashMap<>();
+        if (input.metadata() != null) {
+            requestMetadata.putAll(input.metadata());
+        }
+
+        Optional<MemoryResource> resolvedResource = resolveResource(memoryId, requestMetadata, now);
+        resolvedResource.ifPresent(
+                resource -> {
+                    requestMetadata.put("resourceId", resource.id());
+                    if (resource.mimeType() != null && !resource.mimeType().isBlank()) {
+                        requestMetadata.put("mimeType", resource.mimeType());
+                    }
+                    if (resource.sourceUri() != null && !resource.sourceUri().isBlank()) {
+                        requestMetadata.put("sourceUri", resource.sourceUri());
+                    }
+                    if (resource.storageUri() != null && !resource.storageUri().isBlank()) {
+                        requestMetadata.put("storageUri", resource.storageUri());
+                    }
+                });
+
+        List<MemoryRawData> rawDataList =
+                segments.stream()
+                        .map(
+                                segment -> {
+                                    Segment durableSegment = segment.withoutRuntimeContext();
+                                    Map<String, Object> mergedMetadata =
+                                            mergeSegmentMetadata(
+                                                    requestMetadata, segment.metadata());
+                                    String sourceClient =
+                                            resolveSourceClient(
+                                                    mergedMetadata, segment.runtimeContext());
+                                    if (sourceClient != null) {
+                                        mergedMetadata.put("sourceClient", sourceClient);
+                                    }
+                                    String resourceId = resolveString(mergedMetadata, "resourceId");
+                                    String mimeType = resolveString(mergedMetadata, "mimeType");
+                                    return new MemoryRawData(
+                                            UUID.randomUUID().toString(),
+                                            memoryId.toIdentifier(),
+                                            input.contentType(),
+                                            sourceClient,
+                                            contentId,
+                                            durableSegment,
+                                            segment.caption(),
+                                            resolveString(mergedMetadata, "vectorId"),
+                                            mergedMetadata,
+                                            resourceId,
+                                            mimeType,
+                                            now,
+                                            resolveStartTime(input, segment, now),
+                                            resolveEndTime(input, segment, now));
+                                })
+                        .toList();
+
+        List<ParsedSegment> parsedSegments =
+                IntStream.range(0, segments.size())
+                        .mapToObj(
+                                i -> {
+                                    Segment segment = segments.get(i);
+                                    String rawDataBizId = rawDataList.get(i).id();
+                                    return new ParsedSegment(
+                                            segment.content(),
+                                            segment.caption(),
+                                            getBoundaryStart(segment),
+                                            getBoundaryEnd(segment),
+                                            rawDataBizId,
+                                            rawDataList.get(i).metadata(),
+                                            segment.runtimeContext());
+                                })
+                        .toList();
+
+        // Persistence
+        memoryStore.upsertRawDataWithResources(
+                memoryId, resolvedResource.map(List::of).orElseGet(List::of), rawDataList);
+
+        return new RawDataProcessResult(rawDataList, parsedSegments, false);
+    }
+
+    private RawDataProcessResult existingRawDataResult(MemoryId memoryId, String contentId) {
+        RawDataResult result = toRawDataResult(memoryId, contentId);
+        return new RawDataProcessResult(result.rawDataList(), result.segments(), true);
+    }
+
+    private RawDataResult toRawDataResult(MemoryId memoryId, String contentId) {
+        List<MemoryRawData> rawDataList =
+                memoryStore.rawDataOperations().listRawDataByContentId(memoryId, contentId);
+        List<ParsedSegment> segments = rawDataList.stream().map(this::toParsedSegment).toList();
+        return new RawDataResult(rawDataList, segments, true);
+    }
+
+    private ParsedSegment toParsedSegment(MemoryRawData rawData) {
+        Segment segment = rawData.segment();
+        boolean hasBoundary = segment != null && segment.boundary() != null;
+        return new ParsedSegment(
+                segment == null ? null : segment.content(),
+                rawData.caption(),
+                hasBoundary ? getBoundaryStart(segment) : 0,
+                hasBoundary ? getBoundaryEnd(segment) : 0,
+                rawData.id(),
+                rawData.metadata(),
+                replayRuntimeContext(rawData, segment));
+    }
+
+    private SegmentRuntimeContext replayRuntimeContext(MemoryRawData rawData, Segment segment) {
+        if (segment != null && segment.runtimeContext() != null) {
+            return segment.runtimeContext();
+        }
+        String sourceClient = rawData.sourceClient();
+        if (sourceClient == null && rawData.metadata() != null) {
+            Object metadataSource = rawData.metadata().get("sourceClient");
+            sourceClient = metadataSource == null ? null : metadataSource.toString();
+        }
+        if (rawData.startTime() == null && rawData.endTime() == null && sourceClient == null) {
+            return null;
+        }
+        return new SegmentRuntimeContext(
+                rawData.startTime(), rawData.endTime(), null, sourceClient);
+    }
+
+    private String resolveRawDataContentId(RawDataInput input) {
+        String textContentId = input.content().getContentId();
+        if (!getTypedProcessor(input.content()).usesSourceIdentity()) {
+            return textContentId;
+        }
+        String sourceIdentity = resolveSourceIdentity(input.memoryId(), input.metadata());
+        return HashUtils.sampledSha256(
+                normalizeContentType(input.contentType())
+                        + "|"
+                        + textContentId
+                        + "|"
+                        + (sourceIdentity == null ? "" : sourceIdentity));
+    }
+
+    private String normalizeContentType(String contentType) {
+        return (contentType == null || contentType.isBlank())
+                ? ConversationContent.TYPE
+                : contentType;
+    }
+
+    private String resolveSourceIdentity(MemoryId memoryId, Map<String, Object> metadata) {
+        String resourceId = resolveResourceId(memoryId, metadata);
+        if (resourceId != null) {
+            return resourceId;
+        }
+        String sourceUri = resolveString(metadata, "sourceUri");
+        if (sourceUri != null) {
+            return sourceUri;
+        }
+        String storageUri = resolveString(metadata, "storageUri");
+        if (storageUri != null) {
+            return storageUri;
+        }
+        String fileName = resolveString(metadata, "fileName");
+        String checksum = resolveString(metadata, "checksum");
+        if (fileName != null && checksum != null) {
+            return fileName + "|" + checksum;
+        }
+        return null;
+    }
+
+    private Optional<MemoryResource> resolveResource(
+            MemoryId memoryId, Map<String, Object> requestMetadata, Instant now) {
+        String resourceId = resolveResourceId(memoryId, requestMetadata);
+        if (resourceId == null) {
+            return Optional.empty();
+        }
+
+        String sourceUri = resolveString(requestMetadata, "sourceUri");
+        String storageUri = resolveString(requestMetadata, "storageUri");
+        String fileName = resolveString(requestMetadata, "fileName");
+        String mimeType = resolveString(requestMetadata, "mimeType");
+        String checksum = resolveString(requestMetadata, "checksum");
+        Long sizeBytes = resolveLong(requestMetadata, "sizeBytes");
+        Map<String, Object> resourceMetadata = new LinkedHashMap<>();
+        requestMetadata.forEach(
+                (key, value) -> {
+                    if (!isProjectedResourceKey(key) && !isSegmentOnlyKey(key)) {
+                        resourceMetadata.put(key, value);
+                    }
+                });
+
+        return Optional.of(
+                new MemoryResource(
+                        resourceId,
+                        memoryId.toIdentifier(),
+                        sourceUri,
+                        storageUri,
+                        fileName,
+                        mimeType,
+                        checksum,
+                        sizeBytes,
+                        resourceMetadata,
+                        now));
+    }
+
+    private String resolveResourceId(MemoryId memoryId, Map<String, Object> metadata) {
+        String explicitResourceId = resolveString(metadata, "resourceId");
+        if (explicitResourceId != null) {
+            return explicitResourceId;
+        }
+        String sourceUri = resolveString(metadata, "sourceUri");
+        if (sourceUri != null) {
+            return HashUtils.sampledSha256(memoryId.toIdentifier() + "|" + sourceUri);
+        }
+        String storageUri = resolveString(metadata, "storageUri");
+        if (storageUri != null) {
+            return HashUtils.sampledSha256(memoryId.toIdentifier() + "|" + storageUri);
+        }
+        String fileName = resolveString(metadata, "fileName");
+        String checksum = resolveString(metadata, "checksum");
+        if (fileName != null && checksum != null) {
+            return HashUtils.sampledSha256(
+                    memoryId.toIdentifier() + "|" + fileName + "|" + checksum);
+        }
+        return null;
+    }
+
+    private Map<String, Object> mergeSegmentMetadata(
+            Map<String, Object> requestMetadata, Map<String, Object> segmentMetadata) {
+        Map<String, Object> merged = new LinkedHashMap<>();
+        if (requestMetadata != null) {
+            merged.putAll(requestMetadata);
+        }
+        if (segmentMetadata != null) {
+            merged.putAll(segmentMetadata);
+        }
+        return merged;
+    }
+
+    private boolean isProjectedResourceKey(String key) {
+        return "resourceId".equals(key)
+                || "sourceUri".equals(key)
+                || "storageUri".equals(key)
+                || "fileName".equals(key)
+                || "mimeType".equals(key)
+                || "checksum".equals(key)
+                || "sizeBytes".equals(key);
+    }
+
+    private boolean isSegmentOnlyKey(String key) {
+        return "vectorId".equals(key)
+                || "start_message".equals(key)
+                || "end_message".equals(key)
+                || "startChar".equals(key)
+                || "endChar".equals(key)
+                || "startTime".equals(key)
+                || "endTime".equals(key)
+                || "messages".equals(key);
+    }
+
+    private String resolveString(Map<String, Object> metadata, String key) {
+        if (metadata == null) {
+            return null;
+        }
+        Object value = metadata.get(key);
+        if (value == null) {
+            return null;
+        }
+        String text = value.toString();
+        return text.isBlank() ? null : text;
+    }
+
+    private String resolveSourceClient(
+            Map<String, Object> metadata, SegmentRuntimeContext runtimeContext) {
+        String fromMetadata = resolveString(metadata, "sourceClient");
+        if (fromMetadata != null) {
+            return fromMetadata;
+        }
+        if (runtimeContext == null || runtimeContext.sourceClient() == null) {
+            return null;
+        }
+        String sourceClient = runtimeContext.sourceClient().trim();
+        return sourceClient.isBlank() ? null : sourceClient;
+    }
+
+    private Long resolveLong(Map<String, Object> metadata, String key) {
+        if (metadata == null) {
+            return null;
+        }
+        Object value = metadata.get(key);
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String text && !text.isBlank()) {
+            try {
+                return Long.parseLong(text);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private int getBoundaryStart(Segment segment) {
+        if (segment.boundary() instanceof MessageBoundary mb) {
+            return mb.startMessage();
+        }
+        if (segment.boundary() instanceof CharBoundary cb) {
+            return cb.startChar();
+        }
+        throw new IllegalArgumentException("Unsupported boundary type: " + segment.boundary());
+    }
+
+    private int getBoundaryEnd(Segment segment) {
+        if (segment.boundary() instanceof MessageBoundary mb) {
+            return mb.endMessage();
+        }
+        if (segment.boundary() instanceof CharBoundary cb) {
+            return cb.endChar();
+        }
+        throw new IllegalArgumentException("Unsupported boundary type: " + segment.boundary());
+    }
+
+    private <T extends RawContent> RawContentProcessor<T> getTypedProcessor(T content) {
+        return processorRegistry.resolve(content);
+    }
+
+    private Instant resolveStartTime(RawDataInput input, Segment segment, Instant fallback) {
+        if (input.content() == null) {
+            if (segment.runtimeContext() != null && segment.runtimeContext().startTime() != null) {
+                return segment.runtimeContext().startTime();
+            }
+            return fallback;
+        }
+        return getTypedProcessor(input.content())
+                .resolveSegmentStartTime(input.content(), segment, fallback);
+    }
+
+    private Instant resolveEndTime(RawDataInput input, Segment segment, Instant fallback) {
+        if (input.content() == null) {
+            if (segment.runtimeContext() != null && segment.runtimeContext().observedAt() != null) {
+                return segment.runtimeContext().observedAt();
+            }
+            return fallback;
+        }
+        return getTypedProcessor(input.content())
+                .resolveSegmentEndTime(input.content(), segment, fallback);
+    }
+
+    private record VectorizationResult(List<Segment> segments, List<String> vectorIds) {}
+
+    private record VectorizationCandidate(int index, String text) {}
+
+    private record VectorizedSegment(int index, String vectorId) {}
+}

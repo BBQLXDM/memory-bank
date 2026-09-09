@@ -1,0 +1,69 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.plugin.jdbc.internal.support;
+
+import com.openmemind.ai.memory.core.utils.JsonUtils;
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.ObjectMapper;
+
+public final class JsonCodec {
+
+    private final ObjectMapper objectMapper;
+
+    public JsonCodec() {
+        this(createDefaultObjectMapper());
+    }
+
+    public JsonCodec(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    public String toJson(Object value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JacksonException e) {
+            throw new JdbcPluginException("Failed to serialize JSON", e);
+        }
+    }
+
+    public <T> T fromJson(String json, Class<T> type) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, type);
+        } catch (JacksonException e) {
+            throw new JdbcPluginException("Failed to deserialize JSON", e);
+        }
+    }
+
+    public <T> T fromJson(String json, TypeReference<T> typeReference) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, typeReference);
+        } catch (JacksonException e) {
+            throw new JdbcPluginException("Failed to deserialize JSON", e);
+        }
+    }
+
+    public static ObjectMapper createDefaultObjectMapper() {
+        return JsonUtils.newMapper();
+    }
+}

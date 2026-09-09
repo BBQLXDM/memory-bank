@@ -1,0 +1,212 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.server.controller.admin.insight;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.http.MediaType.APPLICATION_JSON;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import com.openmemind.ai.memory.core.data.InsightPoint;
+import com.openmemind.ai.memory.server.configuration.RequestIdFilter;
+import com.openmemind.ai.memory.server.domain.common.BatchDeleteResult;
+import com.openmemind.ai.memory.server.domain.common.PageResponse;
+import com.openmemind.ai.memory.server.domain.insight.query.InsightPageQuery;
+import com.openmemind.ai.memory.server.domain.insight.view.AdminInsightRegenerateResult;
+import com.openmemind.ai.memory.server.domain.insight.view.AdminInsightTreeView;
+import com.openmemind.ai.memory.server.domain.insight.view.AdminInsightView;
+import com.openmemind.ai.memory.server.handler.ApiExceptionHandler;
+import com.openmemind.ai.memory.server.service.insight.InsightDeleteService;
+import com.openmemind.ai.memory.server.service.insight.InsightQueryService;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.validation.beanvalidation.LocalValidatorFactoryBean;
+import tools.jackson.databind.ObjectMapper;
+
+class AdminInsightControllerTest {
+
+    private final StubInsightQueryService queryService = new StubInsightQueryService();
+    private final StubInsightDeleteService deleteService = new StubInsightDeleteService();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private MockMvc mockMvc;
+
+    @BeforeEach
+    void setUp() {
+        LocalValidatorFactoryBean validator = new LocalValidatorFactoryBean();
+        validator.afterPropertiesSet();
+        this.mockMvc =
+                MockMvcBuilders.standaloneSetup(
+                                new AdminInsightController(queryService, deleteService))
+                        .setControllerAdvice(new ApiExceptionHandler())
+                        .addFilters(new RequestIdFilter())
+                        .setValidator(validator)
+                        .build();
+    }
+
+    @Test
+    void pageUsesPageParameterAndReturnsPagePayload() throws Exception {
+        mockMvc.perform(get("/admin/v1/insights").param("page", "2"))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.timestamp").doesNotExist())
+                .andExpect(jsonPath("$.data.page.page").value(2))
+                .andExpect(jsonPath("$.data.page.totalItems").value(1))
+                .andExpect(jsonPath("$.data.items[0].insightId").value(201));
+
+        assertThat(queryService.recordedQuery.pageNo()).isEqualTo(2);
+        assertThat(queryService.recordedQuery.pageSize()).isEqualTo(20);
+    }
+
+    @Test
+    void treeReturnsRootInsights() throws Exception {
+        mockMvc.perform(get("/admin/v1/insights/tree").param("userId", "u1").param("agentId", "a1"))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.data.roots[0].insightId").value(201));
+    }
+
+    @Test
+    void regenerateReturnsAcceptedResult() throws Exception {
+        mockMvc.perform(post("/admin/v1/insights/{insightId}/regenerate", 201L))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.data.insightId").value(201))
+                .andExpect(jsonPath("$.data.status").value("accepted"));
+    }
+
+    @Test
+    void deleteRequiresIds() throws Exception {
+        mockMvc.perform(
+                        delete("/admin/v1/insights")
+                                .contentType(APPLICATION_JSON)
+                                .content("{\"insightIds\":[]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.error.code").value("validation_failed"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.timestamp").doesNotExist())
+                .andExpect(jsonPath("$.traceId").doesNotExist());
+    }
+
+    @Test
+    void deleteReturnsAffectedMemoryIds() throws Exception {
+        mockMvc.perform(
+                        delete("/admin/v1/insights")
+                                .contentType(APPLICATION_JSON)
+                                .content(
+                                        objectMapper.writeValueAsBytes(
+                                                Map.of("insightIds", List.of(201L)))))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.timestamp").doesNotExist())
+                .andExpect(jsonPath("$.data.deletedCount").value(1))
+                .andExpect(jsonPath("$.data.affectedMemoryIds[0]").value("u1:a1"));
+    }
+
+    @Test
+    void missingInsightReturnsNotFound() throws Exception {
+        queryService.missingInsight = true;
+
+        mockMvc.perform(get("/admin/v1/insights/201"))
+                .andExpect(status().isNotFound())
+                .andExpect(header().exists("X-Request-Id"))
+                .andExpect(jsonPath("$.error.code").value("not_found"))
+                .andExpect(jsonPath("$.code").doesNotExist())
+                .andExpect(jsonPath("$.timestamp").doesNotExist())
+                .andExpect(jsonPath("$.traceId").doesNotExist());
+    }
+
+    private static final class StubInsightQueryService extends InsightQueryService {
+
+        private InsightPageQuery recordedQuery;
+        private boolean missingInsight;
+
+        private StubInsightQueryService() {
+            super(null);
+        }
+
+        @Override
+        public PageResponse<AdminInsightView> listInsights(InsightPageQuery query) {
+            this.recordedQuery = query;
+            return new PageResponse<>(query.pageNo(), query.pageSize(), 1, List.of(insightView()));
+        }
+
+        @Override
+        public AdminInsightView getInsight(Long insightId) {
+            if (missingInsight) {
+                throw new java.util.NoSuchElementException("Insight not found: " + insightId);
+            }
+            return insightView();
+        }
+
+        @Override
+        public AdminInsightTreeView tree(String userId, String agentId) {
+            return new AdminInsightTreeView(List.of(insightView()));
+        }
+
+        @Override
+        public AdminInsightRegenerateResult regenerate(Long insightId) {
+            return new AdminInsightRegenerateResult(insightId, "accepted");
+        }
+    }
+
+    private static final class StubInsightDeleteService extends InsightDeleteService {
+
+        private StubInsightDeleteService() {
+            super(null, null);
+        }
+
+        @Override
+        public BatchDeleteResult deleteInsights(List<Long> insightIds) {
+            return new BatchDeleteResult(1, List.of("u1:a1"));
+        }
+    }
+
+    private static AdminInsightView insightView() {
+        return new AdminInsightView(
+                201L,
+                "u1",
+                "a1",
+                "u1:a1",
+                "profile",
+                "user",
+                "preference",
+                List.of("profile"),
+                "prefers concise answers",
+                List.of(new InsightPoint(InsightPoint.PointType.SUMMARY, "point-1", List.of())),
+                "group-1",
+                Instant.parse("2026-03-31T10:00:00Z"),
+                List.of(),
+                "LEAF",
+                null,
+                List.of(),
+                1,
+                Instant.parse("2026-03-31T10:00:01Z"),
+                Instant.parse("2026-03-31T10:00:02Z"));
+    }
+}

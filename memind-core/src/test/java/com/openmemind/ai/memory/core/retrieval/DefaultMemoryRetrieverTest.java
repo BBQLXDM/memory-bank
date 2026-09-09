@@ -1,0 +1,393 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.openmemind.ai.memory.core.retrieval;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
+
+import com.openmemind.ai.memory.core.retrieval.query.LongQueryCondenser;
+import com.openmemind.ai.memory.core.retrieval.query.QueryContext;
+import com.openmemind.ai.memory.core.retrieval.query.QueryRewriter;
+import com.openmemind.ai.memory.core.retrieval.scoring.ScoredResult;
+import com.openmemind.ai.memory.core.retrieval.strategy.RetrievalStrategy;
+import com.openmemind.ai.memory.core.store.MemoryStore;
+import com.openmemind.ai.memory.core.store.item.ItemOperations;
+import com.openmemind.ai.memory.core.support.TestMemoryIds;
+import com.openmemind.ai.memory.core.textsearch.MemoryTextSearch;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Mono;
+import reactor.test.StepVerifier;
+
+@DisplayName("DefaultMemoryRetriever Unit Test")
+class DefaultMemoryRetrieverTest {
+
+    private final com.openmemind.ai.memory.core.data.MemoryId memoryId = TestMemoryIds.userAgent();
+
+    @Test
+    @DisplayName("strategy error should return DEGRADED status instead of EMPTY")
+    void strategyErrorShouldReturnDegradedStatus() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var strategy = mock(RetrievalStrategy.class);
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(strategy.name()).thenReturn("simple");
+        when(strategy.retrieve(any(), any()))
+                .thenReturn(Mono.error(new RuntimeException("vector store unavailable")));
+
+        var retriever = new DefaultMemoryRetriever(store);
+        retriever.registerStrategy(strategy);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, "hello", RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.status()).isEqualTo(RetrievalStatus.DEGRADED);
+    }
+
+    @Test
+    @DisplayName("successful retrieval with results should have SUCCESS status")
+    void successfulRetrievalWithResultsShouldHaveSuccessStatus() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var strategy = mock(RetrievalStrategy.class);
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(strategy.name()).thenReturn("simple");
+        when(strategy.retrieve(any(), any()))
+                .thenReturn(
+                        Mono.just(
+                                RetrievalResult.of(
+                                        List.of(
+                                                new ScoredResult(
+                                                        ScoredResult.SourceType.ITEM,
+                                                        "item-1",
+                                                        "test",
+                                                        0.9F,
+                                                        0.9,
+                                                        null)),
+                                        List.of(),
+                                        List.of(),
+                                        List.of(),
+                                        "simple",
+                                        "hello")));
+
+        var retriever = new DefaultMemoryRetriever(store);
+        retriever.registerStrategy(strategy);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, "hello", RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(RetrievalStatus.SUCCESS);
+    }
+
+    @Test
+    @DisplayName("successful retrieval with no results should have EMPTY status")
+    void successfulRetrievalWithNoResultsShouldHaveEmptyStatus() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var strategy = mock(RetrievalStrategy.class);
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(strategy.name()).thenReturn("simple");
+        when(strategy.retrieve(any(), any()))
+                .thenReturn(
+                        Mono.just(
+                                RetrievalResult.of(
+                                        List.of(), List.of(), List.of(), List.of(), "simple",
+                                        "hello")));
+
+        var retriever = new DefaultMemoryRetriever(store);
+        retriever.registerStrategy(strategy);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, "hello", RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(RetrievalStatus.EMPTY);
+    }
+
+    @Test
+    @DisplayName("admission skip should return empty result before store and strategy")
+    void admissionSkipShouldReturnEmptyBeforeStoreAndStrategy() {
+        var store = mock(MemoryStore.class);
+        var retriever = new DefaultMemoryRetriever(store);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, "!!!", RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.strategy()).isEqualTo("simple");
+        assertThat(result.query()).isEqualTo("!!!");
+        verifyNoInteractions(store);
+    }
+
+    @Test
+    @DisplayName("admission reject should return empty result before store and strategy")
+    void admissionRejectShouldReturnEmptyBeforeStoreAndStrategy() {
+        var store = mock(MemoryStore.class);
+        var retriever = new DefaultMemoryRetriever(store);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId,
+                                        "hello\u0000world",
+                                        RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.strategy()).isEqualTo("simple");
+        verifyNoInteractions(store);
+    }
+
+    @Test
+    @DisplayName("too long query with no items should not call condenser")
+    void tooLongQueryWithNoItemsShouldNotCallCondenser() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var condenser = mock(LongQueryCondenser.class);
+        var retriever = new DefaultMemoryRetriever(store, null, null, condenser);
+        var longQuery = "word ".repeat(600);
+
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(false);
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, longQuery, RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.query()).isEqualTo(longQuery);
+        verifyNoInteractions(condenser);
+    }
+
+    @Test
+    @DisplayName("too long query with condenser failure should return empty before strategy")
+    void tooLongQueryWithCondenserFailureShouldReturnEmptyBeforeStrategy() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var condenser = mock(LongQueryCondenser.class);
+        var retriever = new DefaultMemoryRetriever(store, null, null, condenser);
+        var longQuery = "word ".repeat(600);
+
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(condenser.condense(eq(memoryId), eq(longQuery), eq(List.of()), eq(512)))
+                .thenReturn(Mono.empty());
+
+        var result =
+                retriever
+                        .retrieve(
+                                RetrievalRequest.of(
+                                        memoryId, longQuery, RetrievalConfig.Strategy.SIMPLE))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.isEmpty()).isTrue();
+        assertThat(result.strategy()).isEqualTo("simple");
+        assertThat(result.query()).isEqualTo(longQuery);
+        verify(condenser).condense(eq(memoryId), eq(longQuery), eq(List.of()), eq(512));
+    }
+
+    @Test
+    @DisplayName("too long query with condenser should retrieve using condensed query")
+    void tooLongQueryWithCondenserShouldRetrieveUsingCondensedQuery() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var strategy = mock(RetrievalStrategy.class);
+        var rewriter = mock(QueryRewriter.class);
+        var condenser = mock(LongQueryCondenser.class);
+        var longQuery = "word ".repeat(600);
+        var condensedQuery = "Alice budget";
+
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(condenser.condense(eq(memoryId), eq(longQuery), eq(List.of("history")), eq(512)))
+                .thenReturn(Mono.just(condensedQuery));
+        when(strategy.name()).thenReturn("simple");
+        when(strategy.retrieve(any(), any()))
+                .thenAnswer(
+                        invocation -> {
+                            QueryContext context = invocation.getArgument(0);
+                            return Mono.just(
+                                    RetrievalResult.empty("simple", context.searchQuery()));
+                        });
+
+        var retriever = new DefaultMemoryRetriever(store, null, rewriter, condenser);
+        retriever.registerStrategy(strategy);
+
+        var result =
+                retriever
+                        .retrieve(
+                                new RetrievalRequest(
+                                        memoryId,
+                                        longQuery,
+                                        List.of("history"),
+                                        RetrievalConfig.simple(),
+                                        Map.of(),
+                                        null,
+                                        null))
+                        .block();
+
+        assertThat(result).isNotNull();
+        assertThat(result.query()).isEqualTo(condensedQuery);
+        verifyNoInteractions(rewriter);
+        verify(strategy)
+                .retrieve(
+                        argThat(context -> condensedQuery.equals(context.searchQuery())),
+                        eq(RetrievalConfig.simple()));
+    }
+
+    @Test
+    @DisplayName("Should fail fast when requested retrieval strategy is not registered")
+    void shouldFailFastWhenStrategyIsMissing() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+
+        var retriever = new DefaultMemoryRetriever(store);
+        var request = RetrievalRequest.of(memoryId, "query", RetrievalConfig.Strategy.SIMPLE);
+
+        assertThatThrownBy(() -> retriever.retrieve(request).block())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("simple")
+                .hasMessageContaining("No retrieval strategy registered");
+    }
+
+    @Test
+    @DisplayName("query rewrite failure falls back to original query")
+    void queryRewriteFailureFallsBackToOriginalQuery() {
+        var store = mock(MemoryStore.class);
+        var itemOperations = mock(ItemOperations.class);
+        var rewriter = mock(QueryRewriter.class);
+        var strategy = mock(RetrievalStrategy.class);
+        when(store.itemOperations()).thenReturn(itemOperations);
+        when(itemOperations.hasItems(memoryId)).thenReturn(true);
+        when(rewriter.rewrite(memoryId, "query", List.of("history")))
+                .thenReturn(Mono.error(new RuntimeException("boom")));
+        when(strategy.name()).thenReturn("simple");
+        when(strategy.retrieve(any(), any()))
+                .thenReturn(Mono.just(RetrievalResult.empty("simple", "query")));
+
+        var retriever = new DefaultMemoryRetriever(store, null, rewriter);
+        retriever.registerStrategy(strategy);
+
+        StepVerifier.create(
+                        retriever.retrieve(
+                                new RetrievalRequest(
+                                        memoryId,
+                                        "query",
+                                        List.of("history"),
+                                        RetrievalConfig.simple(),
+                                        Map.of(),
+                                        null,
+                                        null)))
+                .assertNext(result -> assertThat(result.query()).isEqualTo("query"))
+                .verifyComplete();
+
+        verify(strategy)
+                .retrieve(
+                        argThat(
+                                context ->
+                                        context.rewrittenQuery() == null
+                                                && context.originalQuery().equals("query")),
+                        any());
+    }
+
+    @Test
+    @DisplayName("onDataChanged should tolerate strategy registration during iteration")
+    void onDataChangedShouldTolerateStrategyRegistrationDuringIteration() {
+        var store = mock(MemoryStore.class);
+        var textSearch = mock(MemoryTextSearch.class);
+        var retriever = new DefaultMemoryRetriever(store, textSearch);
+
+        RetrievalStrategy strategyB =
+                new RetrievalStrategy() {
+                    @Override
+                    public String name() {
+                        return "strategy-b";
+                    }
+
+                    @Override
+                    public Mono<RetrievalResult> retrieve(
+                            QueryContext context, RetrievalConfig config) {
+                        return Mono.just(RetrievalResult.empty(name(), context.searchQuery()));
+                    }
+                };
+
+        RetrievalStrategy strategyA =
+                new RetrievalStrategy() {
+                    @Override
+                    public String name() {
+                        return "strategy-a";
+                    }
+
+                    @Override
+                    public Mono<RetrievalResult> retrieve(
+                            QueryContext context, RetrievalConfig config) {
+                        return Mono.just(RetrievalResult.empty(name(), context.searchQuery()));
+                    }
+
+                    @Override
+                    public void onDataChanged(
+                            com.openmemind.ai.memory.core.data.MemoryId changedMemoryId) {
+                        retriever.registerStrategy(strategyB);
+                    }
+                };
+
+        retriever.registerStrategy(strategyA);
+
+        assertThatCode(() -> retriever.onDataChanged(memoryId)).doesNotThrowAnyException();
+
+        verify(textSearch).invalidate(memoryId);
+    }
+}
